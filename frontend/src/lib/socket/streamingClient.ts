@@ -207,4 +207,34 @@ export class StreamingClient {
   isSessionActive(): boolean {
     return this.isConnected && this.sessionConfig !== null;
   }
+
+  /**
+   * Generate speech from text using OpenAI TTS
+   */
+  async generateSpeech(text: string, lang?: string): Promise<ArrayBuffer> {
+    return new Promise((resolve, reject) => {
+      if (!this.socket) {
+        reject(new Error("Not connected to server"));
+        return;
+      }
+
+      this.socket.emit(
+        "tts.generate",
+        { text, lang },
+        (response: { success: boolean; audio?: string; error?: string }) => {
+          if (response.success && response.audio) {
+            // Decode base64 to ArrayBuffer
+            const binaryString = atob(response.audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            resolve(bytes.buffer);
+          } else {
+            reject(new Error(response.error || "TTS generation failed"));
+          }
+        }
+      );
+    });
+  }
 }

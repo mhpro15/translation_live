@@ -61,9 +61,17 @@ export class Session {
   }
 
   shouldProcessBatch() {
-    return (
-      this.audioBufferDuration >= STT_BATCH_SIZE_SECONDS && !this.isProcessing
-    );
+    if (this.isProcessing) return false;
+
+    // Process immediately if we have enough audio
+    const hasEnoughAudio = this.audioBufferDuration >= STT_BATCH_SIZE_SECONDS;
+
+    // Also allow processing if we have some audio and haven't received more in a while
+    const hasMinimumAudio = this.audioBufferDuration >= 0.5; // Minimum 500ms
+    const timeSinceActivity = (Date.now() - this.lastActivityTime) / 1000;
+    const hasStaleAudio = hasMinimumAudio && timeSinceActivity > 2;
+
+    return hasEnoughAudio || hasStaleAudio;
   }
 
   getAudioBatch() {

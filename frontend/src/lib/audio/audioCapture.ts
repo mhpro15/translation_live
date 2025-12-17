@@ -120,14 +120,8 @@ export class AudioCapture {
       throw new Error("Audio context or media stream source not initialized");
     }
 
-    // Create a simple processor using ScriptProcessorNode as fallback.
-    // Note: ScriptProcessorNode is deprecated but still widely supported.
-    const bufferSize = Math.pow(
-      2,
-      Math.ceil(
-        Math.log2((this.audioContext.sampleRate || this.config.sampleRate) / 10)
-      )
-    ); // ~100ms buffer
+    // Use smaller buffer size for lower latency (2048 = ~46ms at 44.1kHz)
+    const bufferSize = 2048;
 
     const scriptProcessor = this.audioContext.createScriptProcessor(
       bufferSize,
@@ -141,16 +135,26 @@ export class AudioCapture {
       (this.config.chunkDurationMs / 1000) * targetSampleRate
     );
 
-    let pending = new Float32Array(chunkSamples * 2);
+    // Pre-allocate buffer to avoid frequent allocations
+    const maxPendingSize = chunkSamples * 4; // Allow up to 4x chunk size
+    let pending = new Float32Array(maxPendingSize);
     let pendingLength = 0;
 
+    // Pre-calculate resampling ratio
+    const needsResampling = inputSampleRate !== targetSampleRate;
+    const resampleRatio = needsResampling
+      ? inputSampleRate / targetSampleRate
+      : 1;
+
     const appendSamples = (samples: Float32Array) => {
-      if (pendingLength + samples.length > pending.length) {
-        const next = new Float32Array(
-          Math.max(pending.length * 2, pendingLength + samples.length)
-        );
+      const spaceNeeded = pendingLength + samples.length;
+      if (spaceNeeded > pending.length) {
+        // Rare case: expand buffer
+        const newSize = Math.max(pending.length * 2, spaceNeeded);
+        const next = new Float32Array(newSize);
         next.set(pending.subarray(0, pendingLength), 0);
         pending = next;
+        console.warn(`Audio buffer expanded to ${newSize} samples`);
       }
       pending.set(samples, pendingLength);
       pendingLength += samples.length;
@@ -158,36 +162,43 @@ export class AudioCapture {
 
     const emitChunksIfReady = () => {
       while (pendingLength >= chunkSamples) {
-        const chunk = pending.slice(0, chunkSamples);
+        // Use subarray instead of slice to avoid copying when possible
+        const chunk = new Float32Array(chunkSamples);
+        chunk.set(pending.subarray(0, chunkSamples));
         this.chunkCallbacks.forEach((callback) => callback(chunk));
-        pending.copyWithin(0, chunkSamples, pendingLength);
-        pendingLength -= chunkSamples;
+
+        // Shift remaining data efficiently
+        const remaining = pendingLength - chunkSamples;
+        if (remaining > 0) {
+          pending.copyWithin(0, chunkSamples, pendingLength);
+        }
+        pendingLength = remaining;
       }
     };
 
+    // Optimized resampling using linear interpolation (faster than block averaging)
     const resampleToTarget = (inputData: Float32Array): Float32Array => {
-      if (!inputSampleRate || inputSampleRate === targetSampleRate)
-        return inputData;
+      if (!needsResampling) return inputData;
 
-      const ratio = inputSampleRate / targetSampleRate;
-      const outputLength = Math.floor(inputData.length / ratio);
+      const outputLength = Math.floor(inputData.length / resampleRatio);
       if (outputLength <= 0) return new Float32Array(0);
 
-      // Simple downsampling with block averaging to reduce aliasing.
       const output = new Float32Array(outputLength);
-      for (let i = 0; i < outputLength; i++) {
-        const start = i * ratio;
-        const end = start + ratio;
-        const startIndex = Math.floor(start);
-        const endIndex = Math.min(Math.floor(end), inputData.length - 1);
 
-        let sum = 0;
-        let count = 0;
-        for (let j = startIndex; j <= endIndex; j++) {
-          sum += inputData[j];
-          count++;
+      // Linear interpolation for smooth resampling
+      for (let i = 0; i < outputLength; i++) {
+        const srcPos = i * resampleRatio;
+        const srcIndex = Math.floor(srcPos);
+        const fraction = srcPos - srcIndex;
+
+        if (srcIndex + 1 < inputData.length) {
+          // Interpolate between two samples
+          output[i] =
+            inputData[srcIndex] * (1 - fraction) +
+            inputData[srcIndex + 1] * fraction;
+        } else {
+          output[i] = inputData[srcIndex];
         }
-        output[i] = count ? sum / count : 0;
       }
       return output;
     };

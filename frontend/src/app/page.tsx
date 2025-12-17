@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useAudioCapture, useStreamingClient } from "@/lib/hooks";
 import { AudioCapture } from "@/lib/audio";
 
@@ -21,7 +21,7 @@ export default function Home() {
     onChunk,
   } = useAudioCapture({
     sampleRate: 16000,
-    chunkDurationMs: 3000,
+    chunkDurationMs: 1500, // Reduced to 1.5s for faster response
   });
 
   const {
@@ -33,6 +33,7 @@ export default function Home() {
     startSession,
     stopSession,
     sendAudioChunk,
+    generateSpeech,
   } = useStreamingClient("http://localhost:3001");
 
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -40,27 +41,59 @@ export default function Home() {
   const [targetLang, setTargetLang] = useState("en");
   const [localError, setLocalError] = useState<string | null>(null);
   const [speakTranslations, setSpeakTranslations] = useState(false);
-  const hasTts =
-    typeof window !== "undefined" && "speechSynthesis" in window;
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const chunkUnsubRef = useRef<(() => void) | null>(null);
   const lastSpokenKeyRef = useRef<string | null>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  const speakText = (text: string, lang?: string) => {
-    if (!text) return;
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  const speakText = useCallback(
+    async (text: string, lang?: string) => {
+      if (!text || !generateSpeech) return;
 
-    try {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      if (lang) utterance.lang = lang;
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      // ignore
-    }
-  };
+      try {
+        setIsSpeaking(true);
+
+        // Stop any currently playing audio
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current = null;
+        }
+
+        console.log(
+          `Generating speech for: ${text.substring(0, 50)}... (lang: ${lang})`
+        );
+
+        // Get audio from backend OpenAI TTS
+        const audioBuffer = await generateSpeech(text, lang);
+
+        // Create blob and play
+        const blob = new Blob([audioBuffer], { type: "audio/mpeg" });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+
+        currentAudioRef.current = audio;
+
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          setIsSpeaking(false);
+          currentAudioRef.current = null;
+        };
+
+        audio.onerror = (err) => {
+          console.error("Audio playback error:", err);
+          URL.revokeObjectURL(url);
+          setIsSpeaking(false);
+          currentAudioRef.current = null;
+        };
+
+        await audio.play();
+      } catch (err) {
+        console.error("TTS failed:", err);
+        setIsSpeaking(false);
+      }
+    },
+    [generateSpeech]
+  );
 
   // Connect to server on mount
   useEffect(() => {
@@ -120,8 +153,10 @@ export default function Home() {
   const handleStopSession = async () => {
     try {
       setLocalError(null);
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
+      // Stop any playing audio
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
       }
       stopAudio();
       await stopSession();
@@ -136,7 +171,6 @@ export default function Home() {
   useEffect(() => {
     if (!speakTranslations) return;
     if (!captions || captions.length === 0) return;
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
 
     const newest = captions[0];
     if (!newest?.isFinal) return;
@@ -147,28 +181,30 @@ export default function Home() {
     if (lastSpokenKeyRef.current === key) return;
     lastSpokenKeyRef.current = key;
 
-    try {
-      // Cancel any queued speech so we stay close to realtime.
-      window.speechSynthesis.cancel();
+    // Defer TTS call to avoid synchronous setState in effect
+    const timeoutId = setTimeout(() => {
+      // Use targetLang state instead of caption's targetLang for consistency
+      const langToUse = targetLang && targetLang !== "none" ? targetLang : "en";
+      console.log(
+        `Auto TTS: speaking "${newest.translated.substring(
+          0,
+          30
+        )}..." in lang: ${langToUse}`
+      );
+      speakText(newest.translated, langToUse).catch((err) =>
+        console.error("Auto TTS failed:", err)
+      );
+    }, 0);
 
-      const utterance = new SpeechSynthesisUtterance(newest.translated);
-      // Use BCP-47 language tag if available (e.g. 'en', 'ja', 'ko').
-      utterance.lang = newest.targetLang || targetLang;
-      utterance.rate = 1;
-      utterance.pitch = 1;
-      utterance.volume = 1;
+    return () => clearTimeout(timeoutId);
+  }, [captions, speakTranslations, targetLang, speakText]);
 
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      // If TTS fails, don't block the rest of the app.
-    }
-  }, [captions, speakTranslations, targetLang]);
-
-  // Cleanup TTS on unmount
+  // Cleanup audio on unmount
   useEffect(() => {
     return () => {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
       }
     };
   }, []);
@@ -270,11 +306,6 @@ export default function Home() {
                 />
                 Speak translated text (TTS)
               </label>
-              {!hasTts && (
-                  <div className="text-xs text-slate-400 mt-1">
-                    Text-to-speech is not available in this browser.
-                  </div>
-                )}
               {targetLang === "none" && (
                 <div className="text-xs text-slate-400 mt-1">
                   Enable a target language to use TTS.
@@ -361,7 +392,7 @@ export default function Home() {
                       )}
                       <button
                         type="button"
-                        disabled={!hasTts}
+                        disabled={isSpeaking}
                         onClick={() => {
                           const hasTranslation =
                             !!caption.translated &&
@@ -377,9 +408,9 @@ export default function Home() {
                           speakText(textToSpeak, langToUse);
                         }}
                         className="text-xs px-2 py-1 rounded border border-slate-500 bg-slate-700/40 hover:bg-slate-700/70 disabled:opacity-50 disabled:hover:bg-slate-700/40"
-                        title={hasTts ? "Play" : "TTS not available"}
+                        title={isSpeaking ? "Playing..." : "Play"}
                       >
-                        Play
+                        {isSpeaking ? "Playing..." : "Play"}
                       </button>
                     </div>
                   </div>

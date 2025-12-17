@@ -64,7 +64,6 @@ export function useAudioCapture(config?: AudioCaptureConfig) {
     isCapturing,
     error,
     onChunk,
-    capture: captureRef.current,
   };
 }
 
@@ -124,6 +123,16 @@ export function useStreamingClient(serverUrl?: string) {
     }
   }, []);
 
+  const generateSpeech = useCallback(
+    async (text: string, lang?: string): Promise<ArrayBuffer> => {
+      if (!clientRef.current) {
+        throw new Error("Client not initialized");
+      }
+      return clientRef.current.generateSpeech(text, lang);
+    },
+    []
+  );
+
   // Set up listeners
   useEffect(() => {
     if (!clientRef.current) return;
@@ -160,6 +169,6 @@ export function useStreamingClient(serverUrl?: string) {
     startSession,
     stopSession,
     sendAudioChunk,
-    client: clientRef.current,
+    generateSpeech,
   };
 }
